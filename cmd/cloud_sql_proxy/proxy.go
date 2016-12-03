@@ -26,6 +26,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"math/rand"
+	"time"
 
 	"github.com/GoogleCloudPlatform/cloudsql-proxy/proxy/fuse"
 	"github.com/GoogleCloudPlatform/cloudsql-proxy/proxy/proxy"
@@ -35,76 +37,88 @@ import (
 // local connections.  Values received from the updates channel are
 // interpretted as a comma-separated list of instances.  The set of sockets in
 // 'dir' is the union of 'instances' and the most recent list from 'updates'.
-func WatchInstances(dir string, cfgs []instanceConfig, updates <-chan string) (<-chan proxy.Conn, error) {
+func WatchInstances(updates <-chan []instanceConfig) (<-chan proxy.Conn, error) {
 	ch := make(chan proxy.Conn, 1)
-
-	// Instances specified statically (e.g. as flags to the binary) will always
-	// be available. They are ignored if also returned by the GCE metadata since
-	// the socket will already be open.
-	staticInstances := make(map[string]net.Listener, len(cfgs))
-	for _, v := range cfgs {
-		l, err := listenInstance(ch, v)
-		if err != nil {
-			return nil, err
-		}
-		staticInstances[v.Instance] = l
-	}
-
-	if updates != nil {
-		go watchInstancesLoop(dir, ch, updates, staticInstances)
-	}
+	go watchInstancesLoop(ch, updates)
 	return ch, nil
 }
 
-func watchInstancesLoop(dir string, dst chan<- proxy.Conn, updates <-chan string, static map[string]net.Listener) {
-	dynamicInstances := make(map[string]net.Listener)
-	for instances := range updates {
-		list, err := parseInstanceConfigs(dir, strings.Split(instances, ","))
+type addressToConfigMap map[localServerAddress][]instanceConfig
+
+func createAddressToConfigMap(configs []instanceConfig) (addressToConfigMap) {
+		out := make(addressToConfigMap)
+		for _, cfg := range configs {
+			out[cfg.localServerAddress] = append(out[cfg.localServerAddress], cfg)
+		}
+		return out
+}
+
+func symmetricDiff(lhs addressToConfigMap, rhs addressToConfigMap) ([]localServerAddress, []localServerAddress) {
+		var inl []localServerAddress
+		var inr []localServerAddress
+		for k, _ := range rhs { if _, ok := lhs[k]; !ok { inr = append(inr, k) } }
+		for k, _ := range lhs { if _, ok := rhs[k]; !ok { inl = append(inl, k) } }
+		return inl, inr
+}
+
+type access struct {
+	addr localServerAddress
+	conn net.Conn
+}
+
+func doAcceptLoop(addr localServerAddress, listener net.Listener, out chan<- access) {
+	for {
+		c, err := listener.Accept()
 		if err != nil {
-			log.Print(err)
-		}
-
-		stillOpen := make(map[string]net.Listener)
-		for _, cfg := range list {
-			instance := cfg.Instance
-
-			// If the instance is specified in the static list don't do anything:
-			// it's already open and should stay open forever.
-			if _, ok := static[instance]; ok {
-				continue
-			}
-
-			if l, ok := dynamicInstances[instance]; ok {
-				delete(dynamicInstances, instance)
-				stillOpen[instance] = l
-				continue
-			}
-
-			l, err := listenInstance(dst, cfg)
-			if err != nil {
-				log.Printf("Couldn't open socket for %q: %v", instance, err)
-				continue
-			}
-			stillOpen[instance] = l
-		}
-
-		// Any instance in dynamicInstances was not in the most recent metadata
-		// update. Clean up those instances' sockets by closing them; note that
-		// this does not affect any existing connections instance.
-		for instance, listener := range dynamicInstances {
-			log.Printf("Closing socket for instance %v", instance)
+			log.Printf("Error in accept: %v", err)
 			listener.Close()
+			return
 		}
-
-		dynamicInstances = stillOpen
+		out <- access { addr: addr, conn: c}
 	}
+}
 
-	for _, v := range static {
-		if err := v.Close(); err != nil {
-			log.Printf("Error closing %q: %v", v.Addr(), err)
+func watchInstancesLoop(dst chan<- proxy.Conn, updates <-chan []instanceConfig) {
+	listeners := make(map[localServerAddress]net.Listener)
+	curConfig := make(addressToConfigMap)
+	bridge := make(chan access)
+	rand.Seed(time.Now().UnixNano())
+	for {
+		select {
+    case e := <-bridge:
+			arr, ok := curConfig[e.addr]
+			if ! ok {
+				e.conn.Close()
+				continue
+			}
+			cfg := arr[rand.Intn(len(arr))]
+			log.Printf("New connection for %q", cfg.Instance)
+			dst <- proxy.Conn { cfg.Instance, e.conn }
+
+    case list := <-updates:
+			newConfig := createAddressToConfigMap(list)
+			closing, opening := symmetricDiff(curConfig, newConfig)
+
+			for _, addr := range closing {
+				log.Printf("Closing socket for address %v", addr)
+				l := listeners[addr]
+				l.Close()
+				delete(listeners, addr)
+			}
+			for _, addr := range opening {
+				l, err := listenInstance(addr, newConfig[addr])
+				if err != nil {
+					log.Printf("Couldn't open socket: %v", err)
+					continue
+				}
+				go doAcceptLoop(addr, l, bridge)
+				listeners[addr] = l
+			}
+			curConfig = newConfig
 		}
 	}
-	for _, v := range dynamicInstances {
+	
+	for _, v := range listeners {
 		if err := v.Close(); err != nil {
 			log.Printf("Error closing %q: %v", v.Addr(), err)
 		}
@@ -119,41 +133,31 @@ func remove(path string) {
 
 // listenInstance starts listening on a new unix socket in dir to connect to the
 // specified instance. New connections to this socket are sent to dst.
-func listenInstance(dst chan<- proxy.Conn, cfg instanceConfig) (net.Listener, error) {
-	unix := cfg.Network == "unix"
+func listenInstance(addr localServerAddress, configs []instanceConfig) (net.Listener, error) {
+	unix := addr.Network == "unix"
 	if unix {
-		remove(cfg.Address)
+		remove(addr.Address)
 	}
-	l, err := net.Listen(cfg.Network, cfg.Address)
+	l, err := net.Listen(addr.Network, addr.Address)
 	if err != nil {
 		return nil, err
 	}
 	if unix {
-		if err := os.Chmod(cfg.Address, 0777|os.ModeSocket); err != nil {
-			log.Printf("couldn't update permissions for socket file %q: %v; other users may not be unable to connect", cfg.Address, err)
+		if err := os.Chmod(addr.Address, 0777|os.ModeSocket); err != nil {
+			log.Printf("couldn't update permissions for socket file %q: %v; other users may not be unable to connect", addr.Address, err)
 		}
 	}
-
-	go func() {
-		for {
-			c, err := l.Accept()
-			if err != nil {
-				log.Printf("Error in accept for %q on %v: %v", cfg, cfg.Address, err)
-				l.Close()
-				return
-			}
-			log.Printf("New connection for %q", cfg.Instance)
-			dst <- proxy.Conn{cfg.Instance, c}
-		}
-	}()
-
-	log.Printf("Listening on %s for %s", cfg.Address, cfg.Instance)
+	log.Printf("Listening on %s", addr)
 	return l, nil
+}
+
+type localServerAddress struct {
+	Network, Address string
 }
 
 type instanceConfig struct {
 	Instance         string
-	Network, Address string
+	localServerAddress
 }
 
 // loopbackForNet maps a network (e.g. tcp6) to the loopback address for that

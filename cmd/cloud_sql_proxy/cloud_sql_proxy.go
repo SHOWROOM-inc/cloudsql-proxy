@@ -375,13 +375,21 @@ func main() {
 		connSrc = c
 		defer fuse.Close()
 	} else {
-		updates := make(chan string)
+		updates := make(chan []instanceConfig, 1)
+		if *instances != "" {
+			updates <- cfgs
+		}
 		if *instanceSrc != "" {
 			go func() {
 				for {
 					err := metadata.Subscribe(*instanceSrc, func(v string, ok bool) error {
 						if ok {
-							updates <- v
+							list, err := parseInstanceConfigs(*dir, strings.Split(v, ","))
+							if err != nil {
+								log.Print(err)
+							} else {
+								updates <- list
+							}
 						}
 						return nil
 					})
@@ -393,7 +401,7 @@ func main() {
 			}()
 		}
 
-		c, err := WatchInstances(*dir, cfgs, updates)
+		c, err := WatchInstances(updates)
 		if err != nil {
 			log.Fatal(err)
 		}
